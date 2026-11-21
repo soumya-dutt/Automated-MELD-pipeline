@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "run_id": "",
+  "source_structure": "",
+  "pdb_file": "prot_meld_input.pdb",
+  "n_residues": 0,
+  "contact_files": {
+    "core": "contacts/core_contacts.csv",
+    "alternatives": "contacts/alternative_contacts.csv"
+  },
+  "n_replicas": 30,
+  "max_cycles": 20000,
+  "timesteps_per_cycle": 25000,
+  "equilibration_cycles": 1000,
+  "ramp_end_cycle": 200,
+  "temperature_min_K": 300.0,
+  "temperature_max_K": 400.0,
+  "forcefield": "ff14sbside",
+  "implicit_solvent_model": "gbNeck2",
+  "nonbonded_cutoff_nm": 1.8,
+  "langevin_seed": 202600,
+  "collections": {
+    "core": {
+      "confidence": 0.95,
+      "alpha_min": 0.6,
+      "alpha_max": 1.0,
+      "scaler_factor": 4.0
+    },
+    "alternatives": {
+      "confidence": 0.65,
+      "alpha_min": 0.0,
+      "alpha_max": 0.8,
+      "scaler_factor": 4.0
+    }
+  },
+  "contact_generation": {
+    "cutoff_A": 8.0,
+    "minimum_sequence_separation": 6,
+    "core_maximum_spread_A": 1.0,
+    "minimum_core_plddt": 80.0,
+    "core_margin_A": 0.5,
+    "alternative_upper_bound_A": 8.5,
+    "force_constant_kj_mol_nm2": 350.0
+  }
+}

@@ -1,0 +1,6 @@
+set default PBradii mbondi3
+source leaprc.protein.ff14SB
+source leaprc.gaff
+mol = loadpdb pdb4amber.pdb
+savepdb mol prot_meld_input.pdb
+quit
