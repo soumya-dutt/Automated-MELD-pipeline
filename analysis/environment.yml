@@ -1,0 +1,12 @@
+name: meld_analysis
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.10
+  - numpy>=1.26
+  - mdtraj>=1.10
+  - pandas>=2
+  - matplotlib>=3.8
+  - scikit-learn>=1.3
+  - umap-learn>=0.5
+  - threadpoolctl

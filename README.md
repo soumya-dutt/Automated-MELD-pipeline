@@ -338,6 +338,46 @@ Outputs remain inside each model folder alongside `prot_meld_input.pdb`. These
 scripts extract separate replica trajectories; subsequent alignment, merging,
 and structural-population analysis are separate processing steps.
 
+## 5. Analyze extracted trajectories
+
+The reusable analysis component supports **one protein with any number of
+starting models and the configured number of replicas**. It reads the same
+preparation manifest as extraction. It needs the prepared PDB/config/contact
+files and extracted numeric DCDs, and does not require `total.dcd`, VMD, MELD,
+CUDA, or a scheduler. It never launches dynamics or submits jobs.
+
+```bash
+# Run from this repository's root after extraction/download has finished.
+conda env create -f analysis/environment.yml
+conda activate meld_analysis
+python analyze_trajectories.py --simulations simulations --dry-run
+python analyze_trajectories.py --simulations simulations --output analysis_results
+
+# Optional structural clustering and UMAP visualization in a separate result.
+python analyze_trajectories.py --simulations simulations --cluster --umap \
+  --output analysis_results_clustered
+```
+
+Open `analysis_results/report.html` for a standalone report. All starting models
+are reference conformations: every retained frame is independently fitted to
+each reference using matched N/C-alpha/C/O atoms. The main RMSD cutoff defaults
+to 4 A, with 2/3/4/5 A sensitivity. Overlapping references produce explicit
+ambiguous assignments; frames outside all cutoffs remain unassigned. Cutoffs,
+replica selection, discarded prefixes, stride, threads and clustering settings
+are configurable. Use a fresh output directory for each analysis.
+
+Pooled replica sampling is primary coverage; replica 0 and every selected
+replica are reported separately. Default exclusion is zero frames, so these
+are **sampling fractions**, not a demonstrated equilibrium population ranking.
+Optional clustering describes a capped, documented sample rather than assigning
+every trajectory frame. No cross-start thermodynamic distribution is inferred.
+
+Full installation, options, aligned cutoff-frame export, output contracts and
+test commands: [analysis/README.md](analysis/README.md). Scientific definitions
+and limitations: [analysis/ANALYSIS.md](analysis/ANALYSIS.md). AI-agent execution
+instructions: [analysis/AGENTS.md](analysis/AGENTS.md). This component has no
+dependency on the original project's system-specific analysis directory.
+
 ## Files and editable protocol
 
 ```text
@@ -345,6 +385,8 @@ Automated_MELD_pipeline/
   pipeline.py                  # Master preparation entry point
   submit_jobs.py               # Job copying, preview, and explicit submission
   extract_all_trajectories.py   # Extract replicas from every model folder
+  analyze_trajectories.py       # Manifest-driven postprocessing; never dynamics
+  analysis/                    # General analysis code, environment and agent guide
   README.md
   structures/                  # User's raw AF2 PDBs
   templates/
@@ -434,7 +476,7 @@ existing Data/Logs. `--archive-existing` explicitly preserves an old setup befor
 building a fresh one; it is not a restart command. `setup_report.json` records
 actual versions, hashes, settings, and validation.
 
-Future population analysis must use equilibrated frames at the same temperature
+Population interpretation must use equilibrated frames at the same temperature
 and restraint conditions across starts, demonstrate convergence, and allow new or
 intermediate states. Count structural states, not active restraint-group IDs.
 Different-temperature pooled trajectories are a coverage overview, not direct

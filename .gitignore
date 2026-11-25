@@ -6,3 +6,5 @@ Data/
 Logs/
 *.dcd
 *.nc
+analysis_results*/
+exports/
