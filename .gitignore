@@ -8,3 +8,5 @@ Logs/
 *.nc
 analysis_results*/
 exports/
+
+fine_grained_github_passkey
