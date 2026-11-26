@@ -1,4 +1,4 @@
-"""Bounded structural clustering on a documented subset, independent of RMSD labels."""
+"""Joint full-frame or explicitly sampled structural clustering, independent of RMSD labels."""
 import math
 from pathlib import Path
 
@@ -16,14 +16,27 @@ def cluster_sample(xyz, records, runs, output, args):
 
     trajectory = md.Trajectory(np.asarray(xyz), runs[0]["backbone_reference"].top)
     provenance = pd.DataFrame(records)
+    eligible_total = 0
+    for run in runs:
+        for item in run["files"]:
+            start = args.discard_frames
+            eligible_total += len(range(start, item["frames"], args.stride))
+    full_assignments = len(records) == eligible_total
     ca = trajectory.top.select("name CA")
     i, j = np.triu_indices(len(ca), k=3)
     pairs = np.column_stack([ca[i], ca[j]])
     if len(pairs) > 4096:
         pairs = pairs[np.linspace(0, len(pairs)-1, 4096, dtype=int)]
-    soft = 1 / (1 + (md.compute_distances(trajectory, pairs, periodic=False) / .8) ** 6) if len(pairs) else np.empty((len(xyz), 0))
+    # Choose contact features using equally capped samples per start, as in the
+    # historical analysis; compute only the selected features over all frames.
+    balanced = []
+    for _, group in provenance.groupby("start_model", sort=False):
+        indices = group.index.to_numpy()
+        balanced.extend(indices[np.linspace(0, len(indices)-1, min(1000, len(indices)), dtype=int)])
+    candidate = md.compute_distances(trajectory[np.asarray(balanced)], pairs, periodic=False) if len(pairs) else np.empty((len(balanced), 0))
+    soft = 1 / (1 + (candidate / .8) ** 6)
     selected = np.argsort(-np.var(soft, axis=0), kind="stable")[:512]
-    contacts = soft[:, selected]
+    contacts = 1 / (1 + (md.compute_distances(trajectory, pairs[selected], periodic=False) / .8) ** 6) if len(selected) else np.empty((len(xyz), 0))
     _, phi = md.compute_phi(trajectory, periodic=False)
     _, psi = md.compute_psi(trajectory, periodic=False)
     angles = np.concatenate([phi, psi], axis=1)
@@ -67,6 +80,7 @@ def cluster_sample(xyz, records, runs, output, args):
                               n_epochs=200, random_state=42, n_jobs=1).fit_transform(reduced)
         provenance["UMAP1"], provenance["UMAP2"] = embedding.T
     provenance.to_csv(output / "cluster_sample_assignments.csv", index=False)
+    provenance.to_csv(output / "cluster_assignments.csv", index=False)
     pd.DataFrame(sensitivity).to_csv(output / "clustering_sensitivity.csv", index=False)
     counts = []
     for name, group in provenance.groupby("start_model", sort=False):
@@ -75,6 +89,29 @@ def cluster_sample(xyz, records, runs, output, args):
             counts.append({"start_model": name, "cluster": int(label), "count": count,
                            "sampled_frames": len(group), "sample_pct": 100*count/len(group)})
     pd.DataFrame(counts).to_csv(output / "cluster_sample_populations.csv", index=False)
+    populations = []
+    for name, group in provenance.groupby("start_model", sort=False):
+        for scope, sub in [("pooled", group), ("replica_0", group[group.replica == 0])]:
+            for label in sorted(set(labels)):
+                count = int(np.sum(sub.cluster == label))
+                populations.append({"start_model": name, "scope": scope, "cluster": int(label),
+                                    "count": count, "n_frames": len(sub),
+                                    "pct": 100*count/len(sub) if len(sub) else None,
+                                    "all_retained_frames_assigned": full_assignments})
+    pd.DataFrame(populations).to_csv(output / "cluster_populations.csv", index=False)
+    diagnostics = []
+    for label in sorted(set(labels)-{-1}):
+        group = provenance[provenance.cluster == label]
+        sources = group.groupby(["start_model", "replica"]).size()
+        diagnostics.append({"cluster": int(label), "n_frames": len(group), "distinct_source_slots": len(sources),
+                            "distinct_starts": group.start_model.nunique(),
+                            "dominant_source_slot_fraction": float(sources.max()/len(group))})
+    pd.DataFrame(diagnostics, columns=["cluster", "n_frames", "distinct_source_slots", "distinct_starts", "dominant_source_slot_fraction"]).to_csv(
+        output / "cluster_source_diagnostics.csv", index=False)
+    source_codes = pd.factorize(pd.MultiIndex.from_frame(provenance[["start_model", "replica"]]))[0]
+    source_ari = float(adjusted_rand_score(labels, source_codes))
+    assigned = sum(d["n_frames"] for d in diagnostics)
+    source_purity = sum(d["n_frames"]*d["dominant_source_slot_fraction"] for d in diagnostics)/assigned if assigned else None
     reps = []
     representative_dir = output / "cluster_representatives"
     representative_dir.mkdir()
@@ -84,18 +121,21 @@ def cluster_sample(xyz, records, runs, output, args):
         pick = members[np.argmin(np.linalg.norm(reduced[members]-centroid, axis=1))]
         row = provenance.iloc[pick]
         run = next(r for r in runs if r["id"] == row.start_model)
-        structure = md.load_frame(str(Path(run["directory"]) / f"{int(row.replica)}.dcd"),
-                                  int(row.replica_frame), top=run["pdb"])
+        structure = md.load_frame(str(output / run["reference_id"] / "total.dcd"),
+                                  int(row.total_frame), top=run["reference"].top)
         filename = f"cluster_{label}.pdb"
         structure.save_pdb(str(representative_dir / filename))
         reps.append({"cluster": int(label), "start_model": row.start_model, "replica": int(row.replica),
-                     "replica_frame": int(row.replica_frame), "pdb": f"cluster_representatives/{filename}"})
-    pd.DataFrame(reps, columns=["cluster", "start_model", "replica", "replica_frame", "pdb"]).to_csv(
+                     "replica_frame": int(row.replica_frame), "total_frame": int(row.total_frame),
+                     "pdb": f"cluster_representatives/{filename}"})
+    pd.DataFrame(reps, columns=["cluster", "start_model", "replica", "replica_frame", "total_frame", "pdb"]).to_csv(
         output / "cluster_representatives.csv", index=False)
     dump_json(output / "clustering_metadata.json", {
         "scope": args.cluster_scope, "discard_fraction_per_replica": args.cluster_discard_fraction,
         "sampled_frames": len(xyz), "sample_counts_per_start": provenance.start_model.value_counts().to_dict(),
-        "full_trajectory_assignments": False, "n_features": features.shape[1],
+        "full_trajectory_assignments": full_assignments, "n_features": features.shape[1],
+        "frame_budget": args.cluster_max_frames, "total_retained_analysis_frames": eligible_total,
+        "feature_selection": "variance in capped balanced samples across starts; no RMSD labels",
         "feature_contact_residue_ordinals_zero_based": [[int(trajectory.top.atom(int(a)).residue.index),
                                                        int(trajectory.top.atom(int(b)).residue.index)]
                                                       for a, b in pairs[selected]],
@@ -105,3 +145,7 @@ def cluster_sample(xyz, records, runs, output, args):
         "min_samples": args.cluster_min_samples, "noise_label": -1,
         "n_clusters": len(set(labels)-{-1}), "noise_pct": 100*float(np.mean(labels == -1)),
         "UMAP_for_visualization_only": args.umap, "random_seed": 42})
+    pd.DataFrame([{"n_clusters": len(set(labels)-{-1}), "noise_pct": 100*float(np.mean(labels == -1)),
+                   "PCA_components": reduced.shape[1], "PCA_variance_retained": float(pca.explained_variance_ratio_.sum()),
+                   "weighted_dominant_source_slot_fraction": source_purity, "ARI_clusters_vs_source_slot": source_ari,
+                   "full_trajectory_assignments": full_assignments}]).to_csv(output / "clustering_overview.csv", index=False)

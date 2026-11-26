@@ -51,7 +51,8 @@ class AnalysisTests(unittest.TestCase):
             config = {"n_replicas": 2, "run_id": name, "langevin_seed": 100+index}
             (folder / "input.json").write_text(json.dumps(config))
             for replica, count in [(0, 6), (1, 4)]:
-                frames = np.stack([self.xyz[j % 3] + [j*.01, 1, 2] for j in range(count)])
+                rotation = np.array([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]])
+                frames = np.stack([self.xyz[j % 3] @ rotation + [j*.01, 1, 2] for j in range(count)])
                 md.Trajectory(frames, top).save_dcd(str(folder / f"{replica}.dcd"))
             records.append({"id": name, "directory": folder.name})
         (self.simulations / "pipeline_manifest.json").write_text(json.dumps({"status": "complete", "runs": records}))
@@ -60,8 +61,11 @@ class AnalysisTests(unittest.TestCase):
         self.temp.cleanup()
 
     def invoke(self, *args):
+        modes = [] if "--cluster" in args or "--no-cluster" in args else ["--no-cluster"]
+        if "--cluster" in args and "--umap" not in args and "--no-umap" not in args:
+            modes.append("--no-umap")
         return subprocess.run([sys.executable, str(ROOT / "analyze_trajectories.py"),
-                               "--simulations", str(self.simulations), "--output", str(self.output), *args],
+                               "--simulations", str(self.simulations), "--output", str(self.output), *modes, *args],
                               capture_output=True, text=True)
 
     def test_rotation_translation_reflection_and_overlap(self):
@@ -112,7 +116,7 @@ class AnalysisTests(unittest.TestCase):
         self.assertEqual(set(chemistry), {"HIE"})
 
     def test_three_models_frame_provenance_and_report(self):
-        result = self.invoke("--discard-frames", "1", "--stride", "2")
+        result = self.invoke("--discard-frames", "1", "--stride", "2", "--no-extract")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         manifest = json.loads((self.output / "analysis_manifest.json").read_text())
         self.assertEqual(manifest["status"], "complete")
@@ -130,6 +134,34 @@ class AnalysisTests(unittest.TestCase):
         self.assertNotIn('src="http', document)
         self.assertNotIn("src='http", document)
         self.assertIn("first model", document)
+        self.assertIn("Backbone RMSD scatter: pooled", document)
+        self.assertIn("Backbone RMSD scatter: replica_0", document)
+        self.assertEqual(len(list((self.output / "pairwise").glob("*/rmsd_scatter*.png"))), 6)
+        self.assertEqual(len(list((self.output / "pairwise").glob("*/two_reference_rmsd.png"))), 3)
+        for name in ["rmsd_distributions.png", "replica_0_rmsd_trace.png", "reference_matches_by_replica.png",
+                     "cutoff_sensitivity.png", "discard_sensitivity.png"]:
+            self.assertTrue((self.output / "reference_0000" / name).is_file())
+        pair_counts = pd.read_csv(self.output / "pairwise_reference_populations.csv")
+        np.testing.assert_array_equal(pair_counts[["A_only", "B_only", "both", "neither"]].sum(axis=1), pair_counts.n_frames)
+        # Merged output includes all source frames despite the analysis prefix/stride.
+        topology = str(self.output / "reference_0000/prot_meld_input.pdb")
+        merged = md.load(str(self.output / "reference_0000/total.dcd"), top=topology)
+        self.assertEqual(merged.n_frames, 10)
+        self.assertEqual(merged.n_atoms, 40)
+        provenance = pd.read_csv(self.output / "reference_0000/frame_provenance.csv")
+        self.assertEqual(provenance.total_frame.tolist(), list(range(10)))
+        self.assertEqual(provenance.replica.tolist(), [0]*6+[1]*4)
+        self.assertEqual(frames.total_frame.tolist(), [1, 3, 5, 7, 9])
+        self.assertFalse(list((self.output / "reference_0000").glob("*_cutoff.dcd")))
+        self.assertTrue((self.output / "reference_0000/closest_to_reference_0001.pdb").exists())
+        source = md.load(str(self.simulations / "model_0/0.dcd"), top=topology)
+        before = np.linalg.norm(source.xyz[:, 0]-source.xyz[:, 4], axis=1)
+        after = np.linalg.norm(merged.xyz[:6, 0]-merged.xyz[:6, 4], axis=1)
+        np.testing.assert_allclose(before, after, atol=1e-5)
+        ref, indices, _, _ = backbone(Path(topology))
+        # Rigid translations are removed in the SAVED coordinates, without
+        # applying a second fit in this assertion.
+        np.testing.assert_allclose(merged.xyz[0, indices], ref.xyz[0, indices], atol=1e-4)
         # Existing output is rejected and never overwritten or marked failed.
         old = (self.output / "analysis_manifest.json").read_bytes()
         self.assertNotEqual(self.invoke().returncode, 0)
@@ -204,8 +236,32 @@ class AnalysisTests(unittest.TestCase):
         np.testing.assert_allclose(populations.groupby("start_model").sample_pct.sum(), 100)
         metadata = json.loads((self.output / "clustering_metadata.json").read_text())
         self.assertFalse(metadata["full_trajectory_assignments"])
+        self.assertTrue((self.output / "cluster_populations.csv").exists())
+        self.assertTrue((self.output / "cluster_source_diagnostics.csv").exists())
+        for name in ["structural_clusters_umap.png", "cluster_population_heatmap.png", "cluster_populations.png", "clustering_sensitivity.png"]:
+            self.assertTrue((self.output / name).is_file())
         for path in (self.output / "cluster_representatives").glob("*.pdb"):
             self.assertEqual(md.load(str(path)).n_atoms, 40)
+
+    def test_full_frame_clustering_and_csv_only_report(self):
+        result = self.invoke("--cluster", "--cluster-max-frames", "0", "--cluster-min-size", "3", "--cluster-min-samples", "2")
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        metadata = json.loads((self.output / "clustering_metadata.json").read_text())
+        self.assertTrue(metadata["full_trajectory_assignments"])
+        self.assertEqual(len(pd.read_csv(self.output / "cluster_assignments.csv")), 30)
+        protected = {str(p.relative_to(self.output)): p.read_bytes() for p in self.output.glob("reference_*/frame_rmsd.csv")}
+        protected["analysis_manifest.json"] = (self.output / "analysis_manifest.json").read_bytes()
+        old_report = (self.output / "report.html").read_bytes()
+        # Move sources away: plot generation must use only saved analysis CSVs.
+        self.simulations.rename(self.area / "sources moved away")
+        result = subprocess.run([sys.executable, "-m", "analysis.report", "--analysis", str(self.output),
+                                 "--reference-pairs", "reference_0000:reference_0001"], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        for relative, expected in protected.items():
+            self.assertEqual((self.output / relative).read_bytes(), expected)
+        backup = list((self.output / "report_backups").glob("*/report.html"))
+        self.assertEqual(len(backup), 1)
+        self.assertEqual(backup[0].read_bytes(), old_report)
 
 
 if __name__ == "__main__":

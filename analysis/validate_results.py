@@ -31,6 +31,7 @@ def main(argv=None):
         runs = manifest["runs"]
         columns = [r["reference_id"] + "_rmsd_A" for r in runs]
         tables, expected_rows, expected_partitions = {}, [], []
+        aligned_checked = 0
         for run in runs:
             table = pd.read_csv(root / run["reference_id"] / "frame_rmsd.csv", dtype={"start_model": str})
             expected = [(item["replica"], frame) for item in run["files"]
@@ -45,6 +46,42 @@ def main(argv=None):
             summary, partition = populations(run, table, runs, columns, settings)
             expected_rows.extend(summary); expected_partitions.extend(partition)
             tables[run["id"]] = table
+            if manifest.get("alignment"):
+                folder = root / run["reference_id"]
+                mapping = pd.read_csv(folder / "frame_provenance.csv")
+                expected_all = [(item["replica"], frame) for item in run["files"] for frame in range(item["frames"])]
+                if list(zip(mapping.replica, mapping.replica_frame)) != expected_all or mapping.total_frame.tolist() != list(range(len(expected_all))):
+                    raise ValueError(f"Merged-frame provenance differs: {run['id']}")
+                lookup = mapping.set_index(["replica", "replica_frame"]).total_frame
+                expected_total = lookup.reindex(pd.MultiIndex.from_arrays([table.replica, table.replica_frame])).to_numpy()
+                if not np.array_equal(table.total_frame, expected_total):
+                    raise ValueError(f"Analysis-to-merged frame mapping differs: {run['id']}")
+                own, indices, _, _ = backbone(folder / "prot_meld_input.pdb")
+                with md.formats.DCDTrajectoryFile(str(folder / "total.dcd")) as handle:
+                    if len(handle) != len(mapping) or handle.read(n_frames=1)[0].shape[1] != own.n_atoms:
+                        raise ValueError(f"Merged DCD count/topology differs: {run['id']}")
+                for sample in np.linspace(0, len(table)-1, min(5, len(table)), dtype=int):
+                    row = table.iloc[sample]
+                    frame = md.load_frame(str(folder / "total.dcd"), int(row.total_frame), top=own.top)
+                    # Direct RMSD checks the saved orientation without refitting.
+                    direct = float(np.sqrt(np.mean(np.sum((frame.xyz[0, indices]-own.xyz[0, indices])**2, axis=1)))*10)
+                    if abs(direct-row[run["reference_id"]+"_rmsd_A"]) > .005:
+                        raise ValueError(f"Saved total.dcd is not backbone-aligned: {run['id']}")
+                for other in runs:
+                    selected = table[table[other["reference_id"]+"_rmsd_A"] <= settings.main_cutoff]
+                    saved = pd.read_csv(folder / f"{other['reference_id']}_selected_frames.csv")
+                    if saved.total_frame.tolist() != selected.total_frame.tolist():
+                        raise ValueError("Cutoff-selected frame provenance differs.")
+                    dcd = folder / f"{other['reference_id']}_cutoff.dcd"
+                    if not getattr(settings, "no_extract", False) and len(selected):
+                        with md.formats.DCDTrajectoryFile(str(dcd)) as handle:
+                            if len(handle) != len(selected): raise ValueError("Cutoff DCD count differs.")
+                    elif dcd.exists():
+                        raise ValueError("Unexpected/stale cutoff DCD.")
+                    closest = json.loads((folder / f"closest_to_{other['reference_id']}.json").read_text())
+                    if abs(closest["rmsd_A"]-table[other["reference_id"]+"_rmsd_A"].min()) > 1e-6:
+                        raise ValueError("Closest-reference snapshot metadata differs.")
+                aligned_checked += 1
         for filename, values in [("reference_populations.csv", expected_rows),
                                  ("assignment_populations.csv", expected_partitions)]:
             actual = pd.read_csv(root / filename, dtype={"start_model": str, "reference_model": str})
@@ -102,7 +139,8 @@ def main(argv=None):
         result = {"status": "passed", "start_models": len(runs),
                   "retained_frames": sum(len(t) for t in tables.values()),
                   "population_tables_recomputed": True, "full_independent_RMSD": args.full_rmsd,
-                  "independent_comparisons": comparisons, "max_RMSD_difference_A": maximum if comparisons else None}
+                  "independent_comparisons": comparisons, "max_RMSD_difference_A": maximum if comparisons else None,
+                  "aligned_merged_trajectories_checked": aligned_checked}
         dump_json(root / "validation.json", result)
         print(json.dumps(result, indent=2))
         return 0

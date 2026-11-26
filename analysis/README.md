@@ -1,242 +1,239 @@
-# Portable MELD trajectory analysis
+# Portable MELD analysis: alignment, sampling and structural clustering
 
-This component analyzes **one protein, any number of prepared starting models**
-from this repository's preparation manifest. It has no protein IDs, fixed model
-count, fixed replica count, scheduler settings or workstation paths. It neither
-imports MELD nor starts simulations. CPU analysis does not require CUDA or VMD.
+Analyze **one protein with any number of starting structures and configured
+replicas**. Inputs come from the preparation manifest. There are no protein IDs,
+fixed model/replica counts, scheduler settings or workstation paths in the code.
+This is CPU postprocessing: no MELD dynamics, CUDA or VMD is required.
 
-Read [ANALYSIS.md](ANALYSIS.md) for methods, output definitions and scientific
-limits. Agents should also read [AGENTS.md](AGENTS.md).
+Read [ANALYSIS.md](ANALYSIS.md) for scientific definitions and limits, and
+[AGENTS.md](AGENTS.md) for the agent execution contract.
 
 ## Install and run
 
-Run these commands from the repository root. Analysis can use a separate conda
-environment, leaving the simulation environment untouched:
+From repository root:
 
 ```bash
 conda env create -f analysis/environment.yml
 conda activate meld_analysis
 python analyze_trajectories.py --help
+python analyze_trajectories.py --simulations simulations --dry-run
+python analyze_trajectories.py --simulations simulations --output analysis_results_new
 ```
 
-On an HPC, load its conda/mamba module first if required. The included environment
-specification supplies NumPy, MDTraj, pandas, matplotlib and threadpoolctl;
-scikit-learn supplies HDBSCAN and optional umap-learn supplies visualization.
-Version ranges are dependency constraints, not a fully pinned lock file. Actual
-versions and analysis source hashes are recorded in every result manifest.
+The **full suite runs by default**: backbone alignment and saved `total.dcd`,
+multi-reference RMSDs, pooled/slot-0 plots, cutoff/closest-frame exports,
+full-frame structural clustering, UMAP and standalone HTML. HDBSCAN needs at
+least the configured minimum cluster/sample size and nonconstant structural
+features; very short or constant test data may require `--no-cluster`.
 
-Finish simulations, then extract/download numbered replicas and the prepared
-input files. Retain `pipeline_manifest.json` at the simulation root. For example:
+For selected reductions in cost:
 
 ```bash
-# Extraction is a separate stage; run in meld_new where MELD is installed.
-conda activate meld_new
-python extract_all_trajectories.py --simulations simulations --dry-run
-python extract_all_trajectories.py --simulations simulations
+# All alignment, RMSD, scatter/sensitivity plots and frame exports; no clustering.
+python analyze_trajectories.py --output analysis_results_rmsd --no-cluster
 
-conda activate meld_analysis
-# No analysis output is created by this preflight.
-python analyze_trajectories.py --simulations simulations --dry-run
+# Explicitly cap the total clustering sample; RMSD analysis still uses all
+# retained frames, and aligned total.dcd still includes every source frame.
+python analyze_trajectories.py --output analysis_results_sampled \
+  --cluster-max-frames 10000 --no-umap
 
-# Structural coverage analysis, without clustering or simulation execution.
-python analyze_trajectories.py --simulations simulations --output analysis_results
-
-# Recompute saved assignments and summary accounting; writes validation.json.
-python -m analysis.validate_results --analysis analysis_results
-
-# Optional independent second-backend RMSDs for EVERY retained frame.
-python -m analysis.validate_results --analysis analysis_results --full-rmsd
+# Skip cutoff-selected DCD exports. Closest PDBs, frame CSVs and total.dcd remain.
+python analyze_trajectories.py --output analysis_results_no_cutoff_dcd --no-extract
 ```
 
-Custom paths may be absolute and may contain spaces when quoted. Defaults are
-relative to the installed repository, not the shell's current working directory.
-All files under the input simulation folders remain unchanged. No `total.dcd`
-is needed, generated or used. Original numeric DCD frame 0 is a sampled frame.
+Inputs and simulation folders are never modified. Use a **fresh output directory**;
+there is no silent overwrite/resume. No new results are generated merely by
+updating this repository's code. Start analysis explicitly when ready.
 
 ## Input contract
 
+Finish extraction first (using `extract_all_trajectories.py` in the MELD
+environment), then keep this layout locally or on the analysis machine:
+
 ```text
 simulations/
-  pipeline_manifest.json          # status=complete, nonempty runs[]
-  <any prepared model directory>/
+  pipeline_manifest.json                 # status=complete, nonempty runs[]
+  <each manifest-listed model folder>/
     prot_meld_input.pdb
-    input.json                   # includes actual n_replicas and protocol
-    contacts/...                 # files referenced by input.json
-    setup_report.json            # checked if present, recommended provenance
+    input.json                          # includes actual n_replicas/protocol
+    contacts/...                        # files referenced by input.json
+    setup_report.json                   # checked when present
     0.dcd ... <n_replicas-1>.dcd
 ```
 
-Discovery uses `runs[].id` and `runs[].directory`, not globbed folder names.
-References are all manifest-listed `prot_meld_input.pdb` files. Each reference
-is assigned a safe `reference_0000`, `reference_0001`, ... identifier in manifest
-order; this is an identifier, not a biological annotation. Original names are
-preserved in tables and the reference mapping.
-
-Default behavior requires every configured replica for every start. To analyze
-only a requested subset, explicitly use `--replicas 0` or `--replicas 0 1 2`.
-Then `pooled` means just those requested indices; it does not imply a full ladder.
-The selection is recorded. Missing files, invalid replica indices, differing
-sequences/chemistry, differing protocols or contacts, changed staged PDB/config
-hashes and topology atom-count mismatches fail preflight. Coordinates must be
-protein-only, single-chain, complete N/Cα/C/O backbones with resolved altlocs.
-The system should already be contiguous; explicit-solvent periodic imaging is
-outside this implicit-solvent pipeline's input contract.
-
-Allowed per-start config differences are `run_id`, `source_structure`, and
-`langevin_seed`; other configuration differences stop the shared analysis.
-Raw PDB residue numbering and atom order need not match across starts:
-the code establishes backbone correspondence by ordered residues and atom name.
-Different all-atom topologies are loaded independently, but differing prepared
-residue chemistry is rejected for the shared-condition analysis.
-
-Preflight reads references and DCD headers/first coordinates. It does not prove
-the remaining DCD records are intact. The actual analysis streams all records,
-checks counts/finite coordinates and stops on corrupt/truncated input. A complete
-preparation manifest does not prove that simulations finished; check run logs
-and extraction completeness separately.
-
-## Cutoffs, windows and computational cost
+Each model's prepared PDB is a reference. Labels `reference_0000`, ... follow
+manifest order; original model IDs are preserved in mapping tables and the HTML.
+All configured replicas must exist unless a subset is explicitly requested:
 
 ```bash
-# Main default cutoff 4 Å; sensitivity cutoffs 2/3/4/5 Å.
-python analyze_trajectories.py --main-cutoff 4 --cutoffs 2 3 4 5 \
-  --output analysis_results_cutoffs
-
-# Illustrative equilibration exclusion: replace N with a reviewed frame count.
-# Do not assume saved frame number equals MELD cycle number.
-python analyze_trajectories.py --discard-frames N --stride 2 \
-  --output analysis_results_post_equilibration
-
-# Analyze only replica 0, without implicitly assuming it is equilibrated.
-python analyze_trajectories.py --replicas 0 --output analysis_results_replica0
-
-# Optional hashes cost an additional full trajectory read at the start/end.
-python analyze_trajectories.py --hash-dcd --output analysis_results_hashed
+python analyze_trajectories.py --replicas 0 --output analysis_results_slot0
 ```
 
-`N` above is a placeholder for a nonnegative integer. Default discard is zero:
-the default run is a coverage survey, not an equilibrated population estimate.
-`--discard-fractions 0 0.1 0.2` is the default sensitivity analysis. Each fraction
-f excludes `floor(original_replica_length*f)` frames independently. The retained
-start is `max(--discard-frames, fractional_prefix)`. These are alternative lower
-bounds, not two prefixes added together. Stride uses the lattice beginning at
-the absolute `--discard-frames` index in each DCD.
+For that example, pooled scope and `total.dcd` contain only the requested slot 0;
+the manifest records this restriction. Default selection includes every slot.
 
-RMSDs are streamed in chunks (`--chunk-size 500`) and starts are processed
-sequentially. `--threads 1` is the default numerical thread limit. Memory for
-RMSD summaries still grows with retained frames × number of references per start.
-There is no automatic GPU use. Increase stride/chunk settings deliberately and
-use a new output directory for a different resolution.
+Sequences and prepared residue chemistry must agree across starts. Protocols
+must agree except for `run_id`, `source_structure` and `langevin_seed`. Shared
+contact files must match by hash. PDB/config/staged contact hashes and saved
+setup checks prevent silently combining different conditions. Each DCD's atom
+count must match its own topology. Require one complete, protein-only chain with
+resolved altlocs and exactly one N, CA, C and O per residue. Atom order and PDB
+numbering may differ between starts; correspondence is established explicitly.
+Periodic imaging and missing-residue alignment are outside this input contract.
 
-## Optional structural clustering
+The no-write analysis preflight checks references and DCD headers/first frames;
+actual analysis streams all coordinates and rejects non-finite or truncated data.
+A complete preparation manifest does not prove the simulation finished.
 
-```bash
-python analyze_trajectories.py --cluster --umap \
-  --cluster-max-frames 10000 --output analysis_results_clustered
+## Alignment and saved merged trajectories
 
-# Use only replica 0 and a reviewed fractional exclusion for clustering.
-python analyze_trajectories.py --cluster --cluster-scope replica_0 \
-  --cluster-discard-fraction 0.2 --output analysis_results_cluster_replica0
-```
+For each starting model, the code:
 
-Clustering is supplementary to direct RMSD assignment. Internal soft-contact
-and periodic torsion features → PCA retaining 90% variance → HDBSCAN leaf groups;
-optional UMAP is for display only. Cluster-size sensitivity and representative
-PDBs are included. Parameters are configurable with `--cluster-fraction`,
-`--cluster-min-size`, and `--cluster-min-samples`.
+1. Loads full-atom frames from the selected numbered DCDs in ascending numeric
+   slot order, retaining original frame order within each file.
+2. Fits each frame's **N/Cα/C/O backbone** to that start's prepared
+   `prot_meld_input.pdb`, using proper Kabsch rotation and translation.
+3. Applies the same rigid transformation to **all atoms** and writes
+   `analysis_results_new/reference_XXXX/total.dcd`.
+4. Saves the matching full-atom topology, `frame_provenance.csv` and
+   `alignment.json` alongside it.
+5. Performs reference comparisons and clustering on the aligned coordinates.
+   Every RMSD comparison independently refits to its own reference to ensure
+   optimal alignment; internal contacts/torsions are rigid-motion invariant.
 
-To bound cost, at most 2,000 frames per start are sampled, also limited by the
-total budget divided across starts. Short starts may provide fewer frames;
-the exact sample counts and frame provenance are saved. Selection is deterministic
-and uniform over eligible concatenated replica indices within each start.
-Clustering does **not** assign unsampled frames. Its `sample_pct` values must not
-be substituted for full-trajectory state populations. Dense density clustering
-can still consume substantial RAM; begin with a smaller sample budget if needed.
-An insufficient or structurally constant sample stops with an explanation;
-rerun without clustering or adjust the documented sampling/model settings.
+**Every frame from every selected replica is saved in `total.dcd`, including
+frames later excluded or strided for analysis.** No synthetic initial PDB frame
+is added. `total_frame=0` is the first extracted sample; the provenance table
+maps every merged frame to its original `replica` and zero-based `replica_frame`.
+Load the merged/cutoff DCDs with the **source start's copied topology**.
+Different starts' all-atom orders need not agree.
 
-## Outputs, completion and frame export
+The fit target is the prepared input PDB, not an inferred average structure or
+an arbitrary frame from another start. Source coordinates and DCD files remain
+unchanged. A merged trajectory is a coverage collection, not a continuous
+physical trajectory; jumps between slot blocks are expected.
 
-The output must be a **new directory**. There is no silent overwrite, resume or
-cache reuse in the portable component. A failed run remains marked `failed`
-(or `running` if interrupted). Inspect it, then choose a new output directory;
-do not present a partial report as a completed analysis.
+## Analysis parameters and cost
 
-Main outputs:
+- Main backbone RMSD cutoff: `--main-cutoff 4` Å.
+- Sensitivity: `--cutoffs 2 3 4 5` and `--discard-fractions 0 0.1 0.2`.
+- `--discard-frames N`: remove that many original frames from every slot **for
+  analysis only**. Replace N with a reviewed nonnegative integer.
+- For fractional prefix f, the lower bound is
+  `max(N, floor(original_slot_length*f))`; prefixes are not added together.
+- `--stride 1`: keep every analysis frame; stride is anchored at N in each slot.
+- `--chunk-size 500`, `--threads 1`: coordinate I/O chunks and numerical threads.
+- `--hash-dcd`: use full trajectory SHA256 in addition to size/mtime signatures;
+  this adds full reads at the beginning/end.
+- `--cluster-max-frames 0`: all eligible analysis frames are clustered (default).
+  A positive integer caps a deterministic per-start share of the global budget.
+- `--cluster-scope pooled|replica_0`, `--cluster-discard-fraction 0`: separately
+  record the clustering window. Unsampled/excluded frames are never assigned.
+- `--cluster-min-size 40`, `--cluster-min-samples 10`,
+  `--cluster-fraction 0.01`: HDBSCAN settings; compare 0.5/1/2% resolution.
+- `--no-cluster`, `--no-umap`, `--no-extract`: explicit feature opt-outs.
 
-- `analysis_manifest.json`: status, settings, inputs, hashes/signatures, model
-  mapping, protocol, versions, source code hashes, and explicit interpretation flags.
-- `reference_rmsd.csv`: all ordered reference-to-reference RMSDs in Å.
-- `reference_*/frame_rmsd.csv`: every retained frame, source replica/frame,
-  every reference RMSD, main-cutoff assignment and overlap count.
-- `reference_populations.csv`: inclusive and exclusive counts for each reference,
-  starting model, replica scope, cutoff and discard fraction.
-- `assignment_populations.csv`: exclusive reference, ambiguous and unassigned
-  categories, which partition the denominator exactly.
-- `primary_pooled_summary.csv`, `secondary_replica0_summary.csv`: main cutoff,
-  zero additional fractional exclusion; any absolute exclusion still applies.
-- `numerical_audit.json`: independent MDTraj/QCP checks of up to three retained
-  frames per chunk/reference. This is a sampled audit, not an all-frame second calculation.
-- `validation.json`: produced by the explicit validator, with accounting status
-  and optional full independent RMSD comparison counts. Check its latest status;
-  an existing HTML does not imply a later validation command passed.
-- `report.html`: standalone report with embedded figures, summary CSVs and
-  provenance/audit downloads. It has no CDN or external figure dependency.
-- Optional clustering: `cluster_sample_assignments.csv`,
-  `cluster_sample_populations.csv`, `clustering_sensitivity.csv`,
-  `clustering_metadata.json`, `cluster_representatives.csv` and full-atom
-  `cluster_representatives/*.pdb`.
+Full-frame density clustering can use substantial RAM/time. Check sample counts
+and available memory before a full run, or choose an explicit sample budget.
+The feature-selection step uses up to 1,000 frames per start for balanced contact
+variance selection; that cap does **not** cap the default clustering assignments.
+All reference pairs are plotted by default, so plot count grows with model count.
+Full-atom merged files and cutoff DCDs need additional disk space; overlapping
+reference matches can duplicate exported coordinates.
 
-HTML includes methods, per-start comparisons, exclusive accounting and cross-run
-interpretation. It does not embed raw DCDs, every per-frame table, or every
-representative PDB. Share the output directory as well when those are needed.
+Default exclusion is zero frames. These defaults produce an untrimmed coverage
+survey, not a declaration of equilibration or a final population rank order.
 
-To export full-atom frames within a reference RMSD cutoff, use actual model IDs
-from the result manifest (replace the quoted example names):
+## Outputs and correspondence with the original pair analysis
 
-```bash
-python -m analysis.export_frames --analysis analysis_results \
-  --start-model 'YOUR_START_MODEL_ID' --reference-model 'YOUR_REFERENCE_MODEL_ID' \
-  --cutoff 4 --scope pooled --output exports/matches.dcd
-```
-
-Export uses only frames retained by the original analysis's absolute exclusion
-and stride. To apply an additional fractional prefix, first analyze that desired
-window with an appropriate absolute exclusion or filter the saved frame table
-in a separately reviewed workflow. The exporter does not apply the sensitivity
-table's fractional windows implicitly.
-
-Each output frame is aligned on N/Cα/C/O to the chosen reference, keeping the
-source's full atom order. Load it with the **starting model's topology**, not
-necessarily the reference topology. A companion `.frames.csv` records the exact
-export order and source indices. No match produces no DCD. Existing exports
-are never overwritten. Use `--simulations /new/root` after relocating source
-folders; relative manifest paths are preserved. Export verifies reference hashes
-and DCD signatures; preserve DCD modification times during copying or originally
-analyze with `--hash-dcd` to permit a hash-based check after relocation.
-
-## Component map
-
-| File | Responsibility |
+| Output | What it contains |
 |---|---|
-| `../analyze_trajectories.py` | Stable CLI entry point |
-| `run_analysis.py` | Manifest validation, streaming and population accounting |
-| `metrics.py` | Explicit atom correspondence, proper Kabsch fits, assignments and hashes |
-| `cluster.py` | Optional bounded internal-feature clustering and representatives |
-| `report.py` | Data-driven plots and standalone HTML |
-| `export_frames.py` | Optional full-atom aligned cutoff DCD export |
-| `validate_results.py` | Post-run frame/assignment/summary audit and optional all-frame QCP check |
-| `environment.yml` | Portable analysis dependencies |
-| `../tests/test_analysis.py` | Synthetic integration/scientific checks |
+| `reference_*/total.dcd`, `prot_meld_input.pdb` | Backbone-aligned full-atom frames and source topology |
+| `reference_*/frame_provenance.csv`, `alignment.json` | All original slot/frame → merged-frame mappings and alignment definition |
+| `reference_*/frame_rmsd.csv` | Retained analysis frames, original and merged indices, all reference RMSDs and assignments |
+| `pairwise/<refA>__<refB>/rmsd_scatter_pooled.png` | Pooled backbone RMSD scatter to two references, panels for every start |
+| `pairwise/.../rmsd_scatter_replica_0.png` | Same comparison using only slot 0 |
+| `pairwise/.../two_reference_rmsd*.png` | Original-style log-count density plots with pooled/slot-0 rows, paginated over starts |
+| `reference_*/rmsd_distributions.png` | Backbone RMSD distributions to all references, pooled and slot 0 |
+| `reference_*/replica_0_rmsd_trace.png` | All reference RMSDs against original slot-0 frame index |
+| `reference_*/reference_matches_by_replica.png` | Inclusive occupancy at every selected temperature/alpha slot |
+| `reference_*/cutoff_sensitivity.png`, `discard_sensitivity.png` | RMSD and per-slot prefix sensitivity |
+| `reference_*/reference_XXXX_selected_frames.csv`, `_cutoff.dcd` | Main-cutoff selected frames for every reference; zero matches create no DCD |
+| `reference_*/closest_to_reference_XXXX.pdb`, `.json` | Closest full-atom frame to each reference, aligned to it, with provenance; closest need not meet cutoff |
+| `reference_populations.csv`, `assignment_populations.csv` | Every start/slot/cutoff/window; inclusive and exclusive/ambiguous/unassigned accounting |
+| `primary_pooled_summary.csv`, `secondary_replica0_summary.csv` | Main cutoff, no additional fractional exclusion; absolute exclusion still applies |
+| `pairwise_reference_populations.csv` | A-only/B-only/both/neither for every plotted reference pair and start/scope |
+| `rmsd_statistics.csv`, `closest_reference_frames.csv`, `sampling_overview.csv` | Quantiles, closest-frame indices and cross-start summary |
+| `cluster_assignments.csv`, `cluster_populations.csv` | Common HDBSCAN labels and per-start pooled/slot-0 populations, with full-versus-sampled status |
+| `cluster_sample_assignments.csv`, `cluster_sample_populations.csv` | Compatibility tables explicitly describing the actual clustered input |
+| `clustering_metadata.json`, `clustering_sensitivity.csv`, `clustering_overview.csv` | Feature/PCA settings, resolution sensitivity, noise and source-slot association |
+| `cluster_source_diagnostics.csv` | Each group's distribution over starts and source slots |
+| `cluster_representatives.csv`, `cluster_representatives/*.pdb` | Actual aligned full-atom sampled frames nearest cluster centroids |
+| `structural_clusters_umap.png`, `cluster_populations.png`, `cluster_population_heatmap.png`, `clustering_sensitivity.png` | Structural embedding, top/all groups, noise and sensitivity |
+| `RESULTS.md`, `report.html` | Readable results and standalone methods/pair-comparison/start-comparison/conclusion report |
+| `analysis_manifest.json`, `numerical_audit.json`, `validation.json` | Input/config/version provenance, sampled numerical audit, explicit validation results |
 
-## Tests
+Clustering labels are fitted jointly across starts of this one protein. Default
+full-frame populations cover all retained analysis frames; explicit sample/window
+restrictions are reported and must accompany their percentages. Noise is retained.
+UMAP is visualization only, not the clustering metric or an RMSD assignment rule.
+
+## Validation and additional exports
+
+```bash
+# Accounting, merged-frame provenance/orientation samples, cutoff counts and closest metadata.
+python -m analysis.validate_results --analysis analysis_results_new
+
+# Also recalculate every retained source/reference RMSD independently with MDTraj/QCP.
+python -m analysis.validate_results --analysis analysis_results_new --full-rmsd
+
+# Export an additional cutoff selection. Replace model IDs with those in the manifest.
+python -m analysis.export_frames --analysis analysis_results_new \
+  --start-model 'YOUR_START_MODEL_ID' --reference-model 'YOUR_REFERENCE_MODEL_ID' \
+  --cutoff 3 --scope replica_0 --output exports/additional_matches.dcd
+```
+
+Full independent validation and additional export currently read original source
+DCDs; use `--simulations /new/root` after relocation. The validator records actual
+comparison counts. A passed sampled audit does not imply an all-frame second
+calculation. Check `analysis_manifest.json: status=complete` and validation status.
+
+## Optional report-only regeneration
+
+When explicitly requested, plots/HTML can be regenerated from existing RMSD CSVs
+without rereading DCDs, rebuilding alignment or rerunning clustering:
+
+```bash
+python -m analysis.report --analysis /path/to/downloaded_analysis
+python -m analysis.report --analysis /path/to/downloaded_analysis --discard-fraction 0.2
+python -m analysis.report --analysis /path/to/downloaded_analysis \
+  --reference-pairs reference_0000:reference_0001
+```
+
+This is an explicit write action: it refreshes derived plots/tables/HTML in that
+directory and backs up its existing HTML under `report_backups/`. Original
+frame-level RMSD/population inputs and the analysis manifest are unchanged.
+`report_manifest.json` records report provenance. A report rebuild cannot create
+missing trajectories, structural features, clusters or representative PDBs.
+The HTML embeds its displayed figures, summary downloads and available
+reference/closest/cluster representative PDBs. Full DCDs and per-frame tables
+remain companion files.
+
+## Components and tests
+
+`../analyze_trajectories.py` calls `run_analysis.py`; `metrics.py` defines matching
+and fitting, `trajectories.py` handles aligned totals and reference exports,
+`cluster.py` handles joint structural clustering, `plotting.py` creates diagnostic
+figures, and `report.py` compiles HTML. `export_frames.py` and
+`validate_results.py` provide explicit follow-up commands. All are contained in
+this project and have no dependency on the historical workspace.
 
 ```bash
 python -m unittest discover -s tests -p test_analysis.py -v
 ```
 
-Fixtures create small PDBs/DCDs in temporary directories. Tests cover proper
-fitting/reflection rejection, overlap, arbitrary start count, one-model input,
-replica/frame accounting, prefix/stride behavior, no-write preflight, failed
-preflight, existing-output protection, sampled clustering, reporting and aligned
-frame export. They do not run MD, call a scheduler or require the example protein.
+Tests use temporary synthetic PDB/DCD files. They cover proper rotations,
+reflection rejection, backbone correspondence, full-atom saved alignment,
+all-replica merging, prefix/stride provenance, overlap, cutoff exports,
+full/sampled clustering, diagnostics and report-only operation without source
+paths. They never run dynamics, submit jobs or modify a user's existing results.

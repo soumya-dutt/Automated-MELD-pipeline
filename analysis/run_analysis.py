@@ -1,4 +1,4 @@
-"""Manifest-driven analysis; numbered DCDs are authoritative, not total.dcd."""
+"""Manifest-driven backbone alignment, merged DCDs and structural ensemble analysis."""
 import argparse
 from datetime import datetime, timezone
 from importlib.metadata import version
@@ -18,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from .metrics import assignments, backbone, digest, dump_json, matched_backbone, rmsd_A, signature
+from .trajectories import aligned_chunks, export_reference_structures
 
 PROJECT = Path(__file__).resolve().parents[1]
 
@@ -128,7 +129,7 @@ def select_sample_rows(run, args, limit):
         count += size
     if not count:
         raise ValueError(f"No frames for clustering after exclusions: {run['id']}")
-    chosen = np.linspace(0, count-1, min(limit, count), dtype=int)
+    chosen = np.linspace(0, count-1, count if limit is None else min(limit, count), dtype=int)
     return {(replica, int(start+(index-offset)*args.stride))
             for replica, start, size, offset in eligible
             for index in chosen[(chosen >= offset) & (chosen < offset+size)]}
@@ -140,57 +141,52 @@ def analyze_run(run, runs, output, args, columns, sample_limit):
     selected = select_sample_rows(run, args, sample_limit) if args.cluster else set()
     pieces, sampled_xyz, sampled_rows = [], [], []
     audit_max, audit_n = 0., 0
-    for item in run["files"]:
+    for item, frames, total_frames, chunk in aligned_chunks(run, folder, args.chunk_size):
         path = item["source"]["path"]
-        offset = 0
-        indices = np.sort(run["indices"])
-        order = np.searchsorted(indices, run["indices"])
-        for raw_chunk in md.iterload(path, top=run["pdb"], atom_indices=indices, chunk=args.chunk_size):
-            chunk = md.Trajectory(raw_chunk.xyz[:, order], run["backbone_reference"].top)
-            frames = np.arange(offset, offset + chunk.n_frames)
-            offset += chunk.n_frames
-            if not np.isfinite(chunk.xyz).all():
-                raise ValueError(f"Non-finite trajectory coordinates: {path}")
-            keep = (frames >= args.discard_frames) & ((frames-args.discard_frames) % args.stride == 0)
-            if not np.any(keep):
-                continue
-            trajectory = chunk[np.flatnonzero(keep)]
-            frames = frames[keep]
-            values = []
-            for other in runs:
-                target = other["reference"].xyz[0, other["indices"]]
-                values.append(rmsd_A(trajectory.xyz, target))
-                # Independent QCP check on the first retained frames in each chunk.
-                test = trajectory[:min(3, trajectory.n_frames)]
-                reference = other["backbone_reference"]
-                comparison = md.rmsd(test, reference, parallel=False) * 10
-                if not np.isfinite(comparison).all():
-                    raise ValueError(f"Independent RMSD audit produced non-finite values: {path}")
-                error = float(np.max(np.abs(values[-1][:len(test)] - comparison)))
-                audit_max = max(audit_max, error)
-                audit_n += len(test)
-                if error > .025:
-                    raise ValueError(f"Independent RMSD audit differs by {error:.5f} A: {path}")
-            distances = np.column_stack(values)
-            hits, labels = assignments(distances, args.main_cutoff)
-            table = pd.DataFrame(distances, columns=columns)
-            table.insert(0, "replica_frame", frames)
-            table.insert(0, "replica", item["replica"])
-            table.insert(0, "start_model", run["id"])
-            table["assignment"] = labels
-            table["n_references_within_cutoff"] = hits.sum(axis=1)
-            pieces.append(table)
-            for index, frame in enumerate(frames):
-                if (item["replica"], int(frame)) in selected:
-                    sampled_xyz.append(trajectory.xyz[index].copy())
-                    sampled_rows.append({"start_model": run["id"], "replica": item["replica"],
-                                         "replica_frame": int(frame), "reference_id": run["reference_id"]})
-        if offset != item["frames"]:
-            raise ValueError(f"DCD frame count changed/truncated: {path}: {offset} != {item['frames']}")
+        if not np.isfinite(chunk.xyz).all():
+            raise ValueError(f"Non-finite trajectory coordinates: {path}")
+        keep = (frames >= args.discard_frames) & ((frames-args.discard_frames) % args.stride == 0)
+        if not np.any(keep):
+            continue
+        trajectory = chunk[np.flatnonzero(keep)]
+        frames = frames[keep]
+        total_frames = total_frames[keep]
+        values = []
+        for other in runs:
+            target = other["reference"].xyz[0, other["indices"]]
+            values.append(rmsd_A(trajectory.xyz, target))
+            # Independent QCP check on the first retained frames in each chunk.
+            test = trajectory[:min(3, trajectory.n_frames)]
+            reference = other["backbone_reference"]
+            comparison = md.rmsd(test, reference, parallel=False) * 10
+            if not np.isfinite(comparison).all():
+                raise ValueError(f"Independent RMSD audit produced non-finite values: {path}")
+            error = float(np.max(np.abs(values[-1][:len(test)] - comparison)))
+            audit_max = max(audit_max, error)
+            audit_n += len(test)
+            if error > .025:
+                raise ValueError(f"Independent RMSD audit differs by {error:.5f} A: {path}")
+        distances = np.column_stack(values)
+        hits, labels = assignments(distances, args.main_cutoff)
+        table = pd.DataFrame(distances, columns=columns)
+        table.insert(0, "replica_frame", frames)
+        table.insert(0, "replica", item["replica"])
+        table.insert(0, "total_frame", total_frames)
+        table.insert(0, "start_model", run["id"])
+        table["assignment"] = labels
+        table["n_references_within_cutoff"] = hits.sum(axis=1)
+        pieces.append(table)
+        for index, frame in enumerate(frames):
+            if (item["replica"], int(frame)) in selected:
+                sampled_xyz.append(trajectory.xyz[index].copy())
+                sampled_rows.append({"start_model": run["id"], "replica": item["replica"],
+                                     "replica_frame": int(frame), "total_frame": int(total_frames[index]),
+                                     "reference_id": run["reference_id"]})
     if not pieces:
         raise ValueError(f"No frames retained: {run['id']}")
     frame_table = pd.concat(pieces, ignore_index=True)
     frame_table.to_csv(folder / "frame_rmsd.csv", index=False)
+    export_reference_structures(run, runs, folder, frame_table, args.main_cutoff, not args.no_extract)
     return frame_table, sampled_xyz, sampled_rows, {"start_model": run["id"],
            "independent_comparisons": audit_n, "max_QCP_difference_A": audit_max}
 
@@ -235,14 +231,21 @@ def main(argv=None):
     parser.add_argument("--chunk-size", type=int, default=500)
     parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--hash-dcd", action="store_true", help="Full SHA256 of trajectories in addition to size/mtime")
-    parser.add_argument("--cluster", action="store_true", help="Optional, bounded sample structural clustering")
+    clustering = parser.add_mutually_exclusive_group()
+    clustering.add_argument("--cluster", dest="cluster", action="store_true", help="Run structural clustering (default)")
+    clustering.add_argument("--no-cluster", dest="cluster", action="store_false", help="Skip structural clustering")
+    parser.set_defaults(cluster=True)
     parser.add_argument("--cluster-scope", choices=["pooled", "replica_0"], default="pooled")
     parser.add_argument("--cluster-discard-fraction", type=float, default=0.)
-    parser.add_argument("--cluster-max-frames", type=int, default=10000, help="Total sample budget across all starts")
+    parser.add_argument("--cluster-max-frames", type=int, default=0, help="Total sample budget; 0 uses every eligible frame (default)")
     parser.add_argument("--cluster-fraction", type=float, default=.01)
     parser.add_argument("--cluster-min-size", type=int, default=40)
     parser.add_argument("--cluster-min-samples", type=int, default=10)
-    parser.add_argument("--umap", action="store_true", help="Optional visualization, requires --cluster")
+    embedding = parser.add_mutually_exclusive_group()
+    embedding.add_argument("--umap", dest="umap", action="store_true", help="UMAP visualization (default with clustering)")
+    embedding.add_argument("--no-umap", dest="umap", action="store_false", help="Use PCA visualization without UMAP")
+    parser.set_defaults(umap=None)
+    parser.add_argument("--no-extract", action="store_true", help="Skip cutoff-selected DCDs; aligned total.dcd and closest PDBs are still saved")
     args = parser.parse_args(argv)
     numbers = [args.main_cutoff, *args.cutoffs, *args.discard_fractions,
                args.cluster_discard_fraction, args.cluster_fraction]
@@ -254,6 +257,9 @@ def main(argv=None):
         parser.error("Discard frames must be nonnegative; fractions must be in [0,1).")
     if not 0 < args.cluster_fraction <= 1 or min(args.cluster_min_size, args.cluster_min_samples) < 2:
         parser.error("Invalid clustering size/fraction.")
+    args.umap = args.cluster if args.umap is None else args.umap
+    if args.cluster_max_frames < 0:
+        parser.error("--cluster-max-frames must be nonnegative; 0 means all eligible frames.")
     if args.umap and not args.cluster:
         parser.error("--umap requires --cluster.")
     args.cutoffs = sorted(set(args.cutoffs + [args.main_cutoff]))
@@ -263,12 +269,12 @@ def main(argv=None):
     try:
         root = args.simulations.resolve()
         preparation_path, runs = discover(root, args.replicas, args.hash_dcd)
-        if args.cluster and args.cluster_max_frames < 2*len(runs):
+        if args.cluster and 0 < args.cluster_max_frames < 2*len(runs):
             raise ValueError("--cluster-max-frames must allow at least two frames per starting model.")
         if output == root or any(output == Path(r["directory"]) or output.is_relative_to(Path(r["directory"]))
                                  or Path(r["directory"]).is_relative_to(output) for r in runs):
             raise ValueError("Analysis output must be separate from simulation model directories.")
-        sample_limit = min(2000, args.cluster_max_frames // len(runs))
+        sample_limit = None if args.cluster_max_frames == 0 else args.cluster_max_frames // len(runs)
         for run in runs:
             if not any(item["frames"] > args.discard_frames for item in run["files"]):
                 raise ValueError(f"No frames after --discard-frames: {run['id']}")
@@ -290,7 +296,10 @@ def main(argv=None):
                     "runs": serial_runs, "sources": sources,
                     "code_sha256": {p.name: digest(p) for p in Path(__file__).parent.glob("*.py")},
                     "primary_scope": "pooled", "secondary_scope": "replica_0",
-                    "numbered_DCD_frame_zero_is_sample": True, "total_dcd_used": False,
+                    "numbered_DCD_frame_zero_is_sample": True, "total_dcd_used": True,
+                    "alignment": {"atoms": ["N", "CA", "C", "O"], "reference": "each start's prepared input PDB",
+                                  "full_atom_total_dcd": "reference_*/total.dcd", "synthetic_initial_frame": False,
+                                  "all_selected_replica_frames_included": True},
                     "dynamics_launched": False, "equilibrium_populations_established": False}
         print(f"Validated {len(runs)} starting models, {sum(len(r['files']) for r in runs)} DCD files, "
               f"{sum(f['frames'] for r in runs for f in r['files']):,} input frames.", flush=True)

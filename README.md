@@ -9,9 +9,9 @@ This implements the normal-MELD restrained-population protocol developed in this
 project. The master script only
 prepares files. A separate command submits jobs to Slurm after you edit the HPC settings.
 
-This working copy already has all 13 supplied models prepared in `simulations/`.
-Use `python pipeline.py --resume` to verify that example. For changed inputs or a
-new protein, choose a fresh output with `--output new_simulations`.
+Preparation creates `simulations/`. Use `python pipeline.py --resume` to verify
+an existing unchanged preparation. For changed inputs or a new protein, choose
+a fresh output with `--output new_simulations`.
 
 ## 1. Environment installation
 
@@ -442,9 +442,10 @@ conda activate meld_analysis
 python analyze_trajectories.py --simulations simulations --dry-run
 python analyze_trajectories.py --simulations simulations --output analysis_results
 
-# Optional structural clustering and UMAP visualization in a separate result.
-python analyze_trajectories.py --simulations simulations --cluster --umap \
-  --output analysis_results_clustered
+# The full suite includes clustering and UMAP by default. For an explicit
+# RMSD/plot/export-only run, omit clustering:
+python analyze_trajectories.py --simulations simulations --no-cluster \
+  --output analysis_results_rmsd_only
 ```
 
 Open `analysis_results/report.html` for a standalone report. All starting models
@@ -455,11 +456,28 @@ ambiguous assignments; frames outside all cutoffs remain unassigned. Cutoffs,
 replica selection, discarded prefixes, stride, threads and clustering settings
 are configurable. Use a fresh output directory for each analysis.
 
+Before analysis, every source frame is aligned on **N/C-alpha/C/O** to its
+starting structure's prepared PDB; the transform is applied to all atoms.
+`analysis_results/reference_XXXX/total.dcd` stores all frames from all selected
+slots, in numeric slot order, alongside its copied topology and original-frame
+map. Analysis burn-in/stride do not remove frames from this merged output, and
+no synthetic initial PDB frame is added. Original simulation files are preserved.
+
+The restored outputs include pooled and slot-0 backbone RMSD scatter plots for
+every reference pair, distributions, slot-0 traces, per-slot occupancy,
+cutoff/prefix sensitivity, closest PDBs and cutoff-selected DCD/CSV exports.
+Joint PCA/HDBSCAN clustering, UMAP, cluster populations/noise, resolution and
+source-slot diagnostics, representatives and readable `RESULTS.md` are included
+in the full suite. The HTML includes per-pair and cross-start conclusions.
+
 Pooled replica sampling is primary coverage; replica 0 and every selected
 replica are reported separately. Default exclusion is zero frames, so these
 are **sampling fractions**, not a demonstrated equilibrium population ranking.
-Optional clustering describes a capped, documented sample rather than assigning
-every trajectory frame. No cross-start thermodynamic distribution is inferred.
+Clustering uses all retained analysis frames by default. For a documented capped
+sample use `--cluster-max-frames 10000`; those cluster percentages describe only
+that sample. Use `--no-umap` to omit the embedding and `--no-extract` to omit
+cutoff-selected DCDs (aligned totals and closest PDBs are still saved).
+No cross-start thermodynamic distribution is inferred.
 
 Full installation, options, aligned cutoff-frame export, output contracts and
 test commands: [analysis/README.md](analysis/README.md). Scientific definitions

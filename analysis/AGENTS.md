@@ -18,11 +18,18 @@ is the entry point. No external workspace directory is a runtime dependency.
 4. Use a new output directory and record the chosen cutoffs, windows and stride.
    Defaults produce a coverage survey. Do not invent a burn-in-to-cycle conversion
    or label a survey as an equilibrium population ranking.
-5. Add `--cluster` only when structural clustering is requested/useful and its
-   bounded sample fits available resources. UMAP is optional display only.
+5. The full suite, including full-frame clustering and UMAP, is the default.
+   Check eligible counts, RAM and disk before running. Use an explicit positive
+   `--cluster-max-frames` budget for sampled clustering, or `--no-cluster` /
+   `--no-umap` when requested or appropriate. Record these reductions clearly.
+   UMAP is display only. Each start's full-atom `reference_*/total.dcd` must be
+   fitted on N/CA/C/O and include every selected source frame before analysis
+   exclusions/stride; the source simulation directories remain unchanged.
 6. Check manifest status `complete`, numerical audit `passed`, output row counts
    and exclusive/ambiguous/unassigned accounting. A `running` or `failed` manifest
    is an incomplete result even if some figures exist.
+   Check zero-based merged frame provenance and the copied topology. Selected
+   cutoff DCDs use the source start's atom order even when fitted to another input.
    Run `python -m analysis.validate_results --analysis OUTPUT` to audit saved
    accounting. Use `--full-rmsd` for an explicit independent all-frame check when
    the extra trajectory I/O is appropriate; verify `validation.json: status=passed`.
@@ -48,5 +55,7 @@ python -m unittest discover -s tests -p test_analysis.py -v
 Test structural correspondence and proper rotations, original replica/frame
 indices, multi-reference overlap, missing/corrupt input behavior and unchanged
 source files for any relevant code change. Optional clustering percentages
-refer to sampled frames only. If the execution contract changes, update both
+refer to the recorded clustered scope; capped runs describe only sampled frames.
+Never rebuild an existing user result/report when asked to change code only.
+If the execution contract changes, update both
 this package's documentation and the top-level README analysis section.
