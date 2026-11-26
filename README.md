@@ -96,6 +96,40 @@ or MELD input requires a fresh output directory. Editing Slurm job files is allo
 
 ## 3. Configure and submit Slurm jobs
 
+### Which file does what?
+
+`job.slurm` reserves HPC resources and prepares the job environment.
+`run_meld.sh` launches one prepared MELD simulation inside that environment.
+They are separate so the same launcher can be used from Slurm, another scheduler,
+or an allocated interactive GPU session. This separation adds no meaningful
+simulation overhead.
+
+| File | Responsibility | What users normally edit |
+|---|---|---|
+| `submit_jobs.py` | Reads the preparation manifest and submits each model's `job.slurm` with `sbatch`. | Supply CLI options; the Python code normally needs no edits. |
+| `templates/job.slurm` | Requests the account, partition, GPU/CPU resources and walltime; loads modules and activates conda; creates/checks the setup; calls `run_meld.sh`. | Your HPC resource requests, module names and environment activation. |
+| `templates/run_meld.sh` | Enters its model folder, checks the saved setup and CUDA compiler, and executes the MELD multiplex launcher. | Normally keep the supplied launcher unchanged. |
+| `templates/system_setup.py` and `templates/input.json` | Build the scientific system and configure replicas, MD steps, temperatures and restraints. | Set the scientific protocol before preparing a new output; see the protocol section below. |
+
+The execution chain for each model is:
+
+```text
+submit_jobs.py --submit
+  -> sbatch job.slurm          (submitted from that model's folder)
+     -> Slurm grants resources and executes job.slurm
+        -> activate environment and locate nvcc
+        -> system_setup.py    (build new Data/Logs, or check existing setup)
+        -> bash run_meld.sh
+           -> check setup
+           -> launch_remd_multiplex --platform CUDA --debug
+```
+
+Preparation copies both shell files into every model folder. The job executes
+those per-model copies. **Each model is one independent Slurm job requesting
+one GPU by default.** The MELD replicas run sequentially within that job's
+multiplex launcher. Four model jobs running together request four GPUs in total;
+Slurm determines their placement and does not automatically group them onto one node.
+
 ### A. Find your HPC settings
 
 A Slurm job file tells the scheduler which resources to reserve and which commands
@@ -147,6 +181,56 @@ Use this table while editing:
 The CPU, memory, and time values are examples, not measured requirements for every
 protein. Some sites use `--gpus=1` or a GPU type in `--gres`; follow their example
 and replace the GPU directive rather than adding conflicting requests.
+
+The complete central `templates/job.slurm` should have the following layout.
+Replace the four `YOUR_...` values using the table above; keep `__JOB_NAME__`
+for the pipeline to fill in. Keep the setup/launcher commands at the end so
+the job builds or checks its input and then launches MELD once.
+
+```bash
+#!/bin/bash -l
+# Edit the account, partition, modules, and example resource requests for your HPC.
+#SBATCH --job-name=__JOB_NAME__
+#SBATCH --account=YOUR_ACCOUNT
+#SBATCH --partition=YOUR_GPU_PARTITION
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --gres=gpu:1
+#SBATCH --mem=32G
+#SBATCH --time=24:00:00
+#SBATCH --output=slurm-%x-%j.out
+#SBATCH --error=slurm-%x-%j.err
+
+set -e
+module load YOUR_CONDA_MODULE
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate meld_new
+module load YOUR_CUDA_MODULE
+
+if ! command -v nvcc >/dev/null 2>&1; then
+    printf '%s\n' 'nvcc is missing. Load the matching CUDA toolkit; see README.' >&2
+    exit 1
+fi
+export OPENMM_CUDA_COMPILER="$(command -v nvcc)"
+cd "${SLURM_SUBMIT_DIR:?Submit this job from its individual simulation folder}"
+
+if [[ ! -e Data && ! -e Logs ]]; then
+    python system_setup.py
+else
+    python system_setup.py --check
+fi
+bash run_meld.sh
+conda deactivate
+```
+
+The `#SBATCH` lines reserve resources. The module and conda commands make the
+installed software available inside the compute job. `OPENMM_CUDA_COMPILER`
+points OpenMM to the executable `nvcc`; `SLURM_SUBMIT_DIR` selects the model
+folder because the submission helper calls `sbatch` from there. `set -e` stops
+the job if environment setup, system preparation, validation or launching fails.
+Environment creation and package installation belong to the installation stage;
+the batch job only activates the existing environment.
 
 Keep `__JOB_NAME__` in the central template: the pipeline fills it automatically
 with a distinct name when copying the job to each model folder. Keep all `#SBATCH`
@@ -265,6 +349,11 @@ The launcher validates the setup and runs
 run; the example requests one GPU and one Slurm task, not one GPU per replica.
 Independent model jobs still need separate allocations. For interrupted runs,
 use the installed MELD version's restart workflow; rebuilding Data starts a new run.
+
+`run_meld.sh` itself does not request resources, activate conda, submit jobs or
+build the initial system. For manual execution, activate the environment and
+prepare/check the system first, inside an allocated GPU session. In the Slurm
+workflow shown above, `job.slurm` performs those environment and setup steps.
 
 ## 4. Extract trajectories after the simulations
 
